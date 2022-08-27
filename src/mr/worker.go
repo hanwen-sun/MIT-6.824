@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"strconv"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,6 +30,92 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+func HandleMap(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string, reply TaskReply, args TaskArgs) error {
+	fmt.Println("Begin Map Task!")
+	file, err := os.Open(reply.Reply_.MapFileName)
+	intermediate := []KeyValue{}
+
+	if err != nil {
+		log.Fatalf("cannot open %v", reply.Reply_.MapFileName)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", reply.Reply_.MapFileName)
+	}
+	file.Close()
+	kva := mapf(reply.Reply_.MapFileName, string(content))
+	intermediate = append(intermediate, kva...)
+	// 把kva写入json文件, 注意使用ihash判断写入哪个文件
+
+	nReduce_ := reply.Reply_.NReduce
+	w_json := make([][]KeyValue, nReduce_)
+	for _, kv := range intermediate {
+		n := ihash(kv.Key) % nReduce_
+		// intername := "mr" + strconv.Itoa(reply.Reply_.TaskId) + strconv.Itoa(n) // mr-m-n
+		w_json[n] = append(w_json[n], kv)
+	}
+
+	for i := 0; i < nReduce_; i++ {
+		interpath := "mr-" + strconv.Itoa(reply.Reply_.TaskId) + "-" + strconv.Itoa(i) + ".json"
+		Info_of_intername, err := json.Marshal(w_json[i])
+		if err == nil {
+			// fmt.Println(string(Info_of_intername))
+		} else {
+			fmt.Println(err)
+			return err
+		}
+
+		fmt.Println(interpath)
+		err = ioutil.WriteFile(interpath, Info_of_intername, 0777)
+		//fmt.Println("write success!")
+
+		if err != nil {
+			fmt.Println("err is:")
+			fmt.Println(err)
+		}
+	}
+	fmt.Println("json write done!")
+
+	ok_ := call("Coordinator.DoneTask", &args, &reply)
+	if !ok_ {
+		fmt.Println("Worker Done Task Failed!")
+	}
+
+	return nil
+}
+
+func HandleReduce(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string, reply TaskReply, args TaskArgs) error {
+	fmt.Println("Begin Reduce Task!")
+	// 1. 把所有文件的内容读入
+	// 2  sort
+	// 3  处理
+	TaskId_ := reply.Reply_.TaskId
+	NMap_ := reply.Reply_.NMap
+
+	intermediate := []mr.KeyValue{}
+	for i := 0; i <= NMap_; i++ {
+		filename := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(TaskId_) + ".json"
+		jsonFile, err := os.Open(filename)
+		if err != nil {
+			fmt.Println("error opening json file")
+			return err
+		}
+
+		intermediate_tmp := []mr.KeyValue{}
+		jsonData, err := ioutil.ReadAll(jsonFile)
+		if err != nil {
+			fmt.Println("error reading json file")
+			return err
+		}
+
+		json.Unmarshal(jsonData, &intermediate_tmp)
+		intermediate = append(intermediate, intermediate_tmp)
+	}
+
+	return nil
+}
 
 //
 // main/mrworker.go calls this function.
@@ -32,6 +124,26 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	// mapf, reducef := loadPlugin(os.Args[1]) // 加载函数;
+
+	for { // 无限循环
+		args := TaskArgs{}
+		args.Id = 0
+		reply := TaskReply{}
+		ok := call("Coordinator.AskTask", &args, &reply) // 注意别拼错
+		// intermediate := []KeyValue{}
+		if !ok {
+			fmt.Println("Worker Ask Task Failed!")
+		} else {
+			if reply.Reply_.TaskType == 0 { // Map任务
+				HandleMap(mapf, reducef, reply, args)
+			} else if reply.Reply_.TaskType == 1 { // Reduce任务
+
+			} else if reply.Reply_.TaskType == 2 { // Sleep
+				time.Sleep(time.Millisecond * 10) // sleep 10秒;
+			}
+		}
+	}
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
@@ -74,14 +186,14 @@ func CallExample() {
 //
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	sockname := coordinatorSock()
-	c, err := rpc.DialHTTP("unix", sockname)
+	sockname := coordinatorSock()            // 获取链接名称;
+	c, err := rpc.DialHTTP("unix", sockname) // 先和服务器建立链接;
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
 	defer c.Close()
 
-	err = c.Call(rpcname, args, reply)
+	err = c.Call(rpcname, args, reply) // 通过call来发起远程调用;
 	if err == nil {
 		return true
 	}
