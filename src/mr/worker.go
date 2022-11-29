@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -20,6 +22,12 @@ type KeyValue struct {
 	Value string
 }
 
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 //
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -31,8 +39,8 @@ func ihash(key string) int {
 }
 
 func HandleMap(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string, reply TaskReply, args TaskArgs) error {
-	fmt.Println("Begin Map Task!")
+	reducef func(string, []string) string, reply *TaskReply, args *TaskArgs) error {
+	// fmt.Println("Begin Map Task!")
 	file, err := os.Open(reply.Reply_.MapFileName)
 	intermediate := []KeyValue{}
 
@@ -66,7 +74,7 @@ func HandleMap(mapf func(string, string) []KeyValue,
 			return err
 		}
 
-		fmt.Println(interpath)
+		// fmt.Println(interpath)
 		err = ioutil.WriteFile(interpath, Info_of_intername, 0777)
 		//fmt.Println("write success!")
 
@@ -75,26 +83,27 @@ func HandleMap(mapf func(string, string) []KeyValue,
 			fmt.Println(err)
 		}
 	}
-	fmt.Println("json write done!")
+	// fmt.Println("json write done!")
 
-	ok_ := call("Coordinator.DoneTask", &args, &reply)
+	// fmt.Println(reply)
+	ok_ := call("Coordinator.DoneTask", &reply, &args)
 	if !ok_ {
-		fmt.Println("Worker Done Task Failed!")
+		fmt.Println("Worker Done Map Task Failed!")
 	}
 
 	return nil
 }
 
 func HandleReduce(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string, reply TaskReply, args TaskArgs) error {
-	fmt.Println("Begin Reduce Task!")
+	reducef func(string, []string) string, reply *TaskReply, args *TaskArgs) error {
+	// fmt.Println("Begin Reduce Task!")
 	// 1. 把所有文件的内容读入
 	// 2  sort
 	// 3  处理
 	TaskId_ := reply.Reply_.TaskId
 	NMap_ := reply.Reply_.NMap
 
-	intermediate := []mr.KeyValue{}
+	intermediate := []KeyValue{}
 	for i := 0; i <= NMap_; i++ {
 		filename := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(TaskId_) + ".json"
 		jsonFile, err := os.Open(filename)
@@ -103,7 +112,7 @@ func HandleReduce(mapf func(string, string) []KeyValue,
 			return err
 		}
 
-		intermediate_tmp := []mr.KeyValue{}
+		intermediate_tmp := []KeyValue{}
 		jsonData, err := ioutil.ReadAll(jsonFile)
 		if err != nil {
 			fmt.Println("error reading json file")
@@ -111,7 +120,37 @@ func HandleReduce(mapf func(string, string) []KeyValue,
 		}
 
 		json.Unmarshal(jsonData, &intermediate_tmp)
-		intermediate = append(intermediate, intermediate_tmp)
+
+		intermediate = append(intermediate, intermediate_tmp...)
+
+		// intermediate = append(intermediate, intermediate_tmp)
+	}
+	sort.Sort(ByKey(intermediate))
+	oname := "mr-out-" + strconv.Itoa(TaskId_)
+
+	ofile, _ := ioutil.TempFile("", "mr-tmp-*")
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		i = j
+	}
+
+	oldpath := filepath.Join(ofile.Name())
+	os.Rename(oldpath, oname)
+
+	ok_ := call("Coordinator.DoneTask", &reply, &args)
+	if !ok_ {
+		fmt.Println("Worker Done Reduce Task Failed!")
 	}
 
 	return nil
@@ -135,19 +174,21 @@ func Worker(mapf func(string, string) []KeyValue,
 		if !ok {
 			fmt.Println("Worker Ask Task Failed!")
 		} else {
+			// fmt.Println(reply.Reply_)
 			if reply.Reply_.TaskType == 0 { // Map任务
-				HandleMap(mapf, reducef, reply, args)
+				HandleMap(mapf, reducef, &reply, &args)
 			} else if reply.Reply_.TaskType == 1 { // Reduce任务
-
+				HandleReduce(mapf, reducef, &reply, &args)
 			} else if reply.Reply_.TaskType == 2 { // Sleep
-				time.Sleep(time.Millisecond * 10) // sleep 10秒;
+				time.Sleep(time.Millisecond * 10) // sleep 10毫秒;
+			} else if reply.Reply_.TaskType == 3 { // kill Task
+				os.Exit(1) // 直接退出进程;
 			}
 		}
 	}
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
-
 }
 
 //
